@@ -539,50 +539,94 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   
     if (signinForm) {
-      signinForm.onsubmit = (e) => {
+      signinForm.onsubmit = async (e) => {
         e.preventDefault();
-  
-        const email = document.getElementById('signin-email').value;
-  
-        currentUser = {
-          name: email.split('@')[0],
-          email
-        };
-  
-        localStorage.setItem('aura_user', JSON.stringify(currentUser));
-  
-        updateNavAuth();
-        toggleAuth();
-        signinForm.reset();
+    
+        const email = document.getElementById('signin-email').value.trim();
+        const password = document.getElementById('signin-password').value.trim();
+    
+        try {
+          const response = await fetch('/api/login', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              email,
+              password
+            })
+          });
+    
+          const data = await response.json();
+    
+          if (data.success) {
+            currentUser = data.user;
+    
+            localStorage.setItem(
+              'aura_user',
+              JSON.stringify(currentUser)
+            );
+    
+            updateNavAuth();
+            toggleAuth();
+            signinForm.reset();
+    
+            alert("Login Successful!");
+          } else {
+            alert(data.message);
+          }
+    
+        } catch (error) {
+          console.log(error);
+          alert("Login failed");
+        }
       };
     }
   
     if (signupForm) {
       signupForm.onsubmit = async (e) => {
         e.preventDefault();
-  
-        const name = document.getElementById('signup-name').value;
-        const email = document.getElementById('signup-email').value;
-
-        // Send Welcome Email
+    
+        const name = document.getElementById('signup-name').value.trim();
+        const email = document.getElementById('signup-email').value.trim();
+        const password = document.getElementById('signup-password').value.trim();
+    
         try {
-          await fetch('/api/signup', {
+          const response = await fetch('/api/signup', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, email })
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              name,
+              email,
+              password
+            })
           });
+    
+          const data = await response.json();
+    
+          if (data.success) {
+            currentUser = { name, email };
+    
+            localStorage.setItem(
+              'aura_user',
+              JSON.stringify(currentUser)
+            );
+    
+            updateNavAuth();
+            toggleAuth();
+            signupForm.reset();
+    
+            alert("Signup Successful!");
+          } else {
+            alert(data.message);
+          }
+    
         } catch (error) {
-          console.error("Welcome email error", error);
+          console.log(error);
+          alert("Signup failed");
         }
-  
-        currentUser = { name, email };
-  
-        localStorage.setItem('aura_user', JSON.stringify(currentUser));
-  
-        updateNavAuth();
-        toggleAuth();
-        signupForm.reset();
-        alert(`Account created! A welcome email has been sent to ${email}`);
       };
     }
   
