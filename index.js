@@ -5,6 +5,9 @@ const path = require("path");
 const nodemailer = require("nodemailer");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const Razorpay = require("razorpay");      // <-- NEW
+const crypto = require("crypto");          // <-- NEW
 
 /* IMPORTANT:
    make sure file names match exactly:
@@ -30,6 +33,29 @@ mongoose
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Initialize Razorpay with your keys from .env
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ message: "No token provided" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ message: "Invalid token" });
+  }
+}
 app.use(express.static(__dirname));
 app.use(express.json());
 
@@ -147,6 +173,56 @@ app.post("/api/checkout", async (req, res) => {
   }
 });
 
+/* ========== NEW RAZORPAY ROUTES ========== */
+
+// Create a Razorpay order (called from frontend before payment)
+app.post("/api/create-razorpay-order", async (req, res) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount || isNaN(amount)) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const options = {
+      amount: Math.round(amount * 100), // amount in paise
+      currency: "INR",
+      receipt: "receipt_" + Date.now(),
+    };
+
+    const order = await razorpay.orders.create(options);
+    res.json(order);
+  } catch (error) {
+    console.error("Razorpay Order Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Verify payment signature after successful payment
+app.post("/api/verify-payment", async (req, res) => {
+  try {
+    const { order_id, payment_id, signature } = req.body;
+
+    const body = order_id + "|" + payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
+
+    if (expectedSignature === signature) {
+      // Payment is genuine – you can update order status in your DB here
+      res.json({ success: true, message: "Payment verified" });
+    } else {
+      res.status(400).json({ success: false, message: "Invalid signature" });
+    }
+  } catch (error) {
+    console.error("Verification Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* ========== END RAZORPAY ROUTES ========== */
+
 /* SIGNUP API */
 app.post("/api/signup", async (req, res) => {
   try {
@@ -237,9 +313,16 @@ app.post("/api/login", async (req, res) => {
       });
     }
 
+    const token = jwt.sign(
+      { userId: user._id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "1d" }
+    );
+    
     res.json({
       success: true,
       message: "Login successful",
+      token,
       user: {
         name: user.name,
         email: user.email

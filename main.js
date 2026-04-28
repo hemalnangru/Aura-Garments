@@ -323,8 +323,9 @@ document.addEventListener('DOMContentLoaded', () => {
       };
     }
   
+    // ========== FIXED: added 'async' to the submit handler ==========
     if (checkoutForm) {
-      checkoutForm.addEventListener('submit', (e) => {
+      checkoutForm.addEventListener('submit', async (e) => {
         e.preventDefault();
     
         const total = getCartTotal().toFixed(2);
@@ -337,7 +338,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
           const email = document.getElementById('customer-email').value;
 
-          // Generate invoice and get base64 string
+          // Generate invoice and get base64 string (no auto download)
           const invoiceBase64 = generateInvoice(orderId, total);
 
           // Make API call to backend
@@ -403,26 +404,62 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
     
+        // ========== UPDATED RAZORPAY INTEGRATION ==========
         if (payment === "Razorpay") {
-          const options = {
-            key: "rzp_test_1234567890",
-            amount: parseFloat(total) * 100,
-            currency: "INR",
-            name: "Aura Garments",
-            description: "Order Payment",
-            handler: function () {
-              alert("Payment Successful!");
-              completeOrder();
-            },
-            theme: {
-              color: "#000000"
-            }
-          };
-    
-          const rzp = new Razorpay(options);
-          rzp.open();
-          return;
+          try {
+            // 1. Create order on backend
+            const orderRes = await fetch('/api/create-razorpay-order', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ amount: parseFloat(total) })
+            });
+            const orderData = await orderRes.json();
+            if (!orderRes.ok) throw new Error(orderData.error || 'Failed to create order');
+
+            // 2. Open Razorpay checkout with the order_id
+            const options = {
+              key: "rzp_live_SizVXhFg9OKjs4",   // your live key
+              amount: orderData.amount,
+              currency: orderData.currency,
+              name: "Aura Garments",
+              description: "Order Payment",
+              order_id: orderData.id,
+              handler: async function (response) {
+                // 3. Verify payment signature on backend
+                const verifyRes = await fetch('/api/verify-payment', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    order_id: response.razorpay_order_id,
+                    payment_id: response.razorpay_payment_id,
+                    signature: response.razorpay_signature
+                  })
+                });
+                const verifyData = await verifyRes.json();
+                if (verifyData.success) {
+                  alert("Payment Successful!");
+                  await completeOrder();   // your existing completeOrder function
+                } else {
+                  alert("Payment verification failed. Please contact support.");
+                }
+              },
+              prefill: {
+                name: document.getElementById('customer-name')?.value || "",
+                email: document.getElementById('customer-email')?.value || "",
+                contact: document.getElementById('customer-phone')?.value || ""
+              },
+              theme: { color: "#000000" }
+            };
+            const rzp = new Razorpay(options);
+            rzp.open();
+            return;
+          } catch (err) {
+            console.error("Razorpay Error:", err);
+            alert("Payment initiation failed: " + err.message);
+            return;
+          }
         }
+        // ========== END OF UPDATED RAZORPAY INTEGRATION ==========
     
         completeOrder();
       });
@@ -758,11 +795,47 @@ document.addEventListener('DOMContentLoaded', () => {
     renderCart();
     updateNavAuth();
 
-    // Invoice PDF
+    // Load custom products from localStorage (so admin-added products persist after refresh)
+    function loadCustomProducts() {
+        const savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
+        const grid = document.querySelector('.product-grid');
+        
+        savedProducts.forEach(product => {
+            // Avoid duplicates – check if product with same ID already exists in DOM
+            if (document.querySelector(`.quick-add[data-id="${product.id}"]`)) return;
+            
+            const card = document.createElement('div');
+            card.className = 'product-card';
+            card.innerHTML = `
+                <div class="product-image">
+                    <img src="${product.image}" alt="${product.name}">
+                    <button class="wishlist-btn">♡</button>
+                    <button class="quick-add"
+                        ${parseInt(product.stock) <= 0 ? 'disabled style="opacity:.6;cursor:not-allowed;"' : ""}
+                        data-id="${product.id}"
+                        data-name="${product.name}"
+                        data-price="₹${product.price}"
+                        data-image="${product.image}">
+                        Add to Bag
+                    </button>
+                </div>
+                <div class="product-info">
+                    <h3>${product.name}</h3>
+                    <p class="price">₹${product.price}</p>
+                    <p style="font-size:14px;color:#666;">
+                        ${parseInt(product.stock) > 0 ? "Stock: " + product.stock : "Out of Stock"}
+                    </p>
+                </div>
+            `;
+            grid.appendChild(card);
+        });
+    }
+
+    loadCustomProducts();  // Call it so saved products appear after refresh
+
+    // Invoice PDF - generates base64 string, does NOT auto-download
     function generateInvoice(orderId, total) {
-
         const { jsPDF } = window.jspdf;
-
         const doc = new jsPDF();
 
         doc.setFontSize(20);
@@ -778,8 +851,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         doc.text("Thank you for shopping with Aura Garments.", 20, 85);
 
-        doc.save("Aura-Invoice-" + orderId + ".pdf");
-        
+        // No doc.save() here – we only return the data URI for email attachment
         return doc.output('datauristring');
     }
 
@@ -858,7 +930,8 @@ document.addEventListener('DOMContentLoaded', () => {
             link.click();
         };
     }
-    // Product Manager
+
+    // Product Manager (Admin)
     const addProductBtn = document.getElementById('add-product-btn');
     const newProductName = document.getElementById('new-product-name');
     const newProductPrice = document.getElementById('new-product-price');
@@ -867,133 +940,79 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (addProductBtn) {
         addProductBtn.onclick = () => {
-
             const name = newProductName.value.trim();
             const price = newProductPrice.value.trim();
             const image = newProductImage.value.trim();
-            const stock = newProductStock.value.trim();
+            const stock = parseInt(newProductStock.value.trim());
 
-            if (!name || !price || !image || !stock) {
-                alert("Fill all product fields.");
+            if (!name || !price || !image || isNaN(stock)) {
+                alert("Fill all product fields with valid data.");
                 return;
             }
 
-            const grid = document.querySelector('.product-grid');
-
-            const card = document.createElement('div');
-            card.className = 'product-card';
-
-            card.innerHTML = `
-                <div class="product-image">
-                    <img src="${image}" alt="${name}">
-                    <button class="wishlist-btn">♡</button>
-                    <button class="quick-add"
-                        ${parseInt(stock) <= 0 ? 'disabled style="opacity:.6;cursor:not-allowed;"' : ""}
-                        data-id="${Date.now()}"
-                        data-name="${name}"
-                        data-price="₹${price}"
-                        data-image="${image}">
-                        Add to Bag
-                    </button>
-                </div>
-
-                <div class="product-info">
-                    <h3>${name}</h3>
-                    <p class="price">₹${price}</p>
-                </div>
-            `;
-
-            grid.prepend(card);
-
-            newProductName.value = "";
-            newProductPrice.value = "";
-            newProductImage.value = "";
-
-            alert("Product Added Successfully!");
-
-            // location.reload();
-        };
-    }
-    // Permanent Products Load
-    function loadCustomProducts() {
-
-        const savedProducts =
-            JSON.parse(localStorage.getItem('aura_products')) || [];
-
-        const grid = document.querySelector('.product-grid');
-
-        savedProducts.forEach(product => {
-
-            const card = document.createElement('div');
-            card.className = 'product-card';
-
-            card.innerHTML = `
-                <div class="product-image">
-                    <img src="${product.image}" alt="${product.name}">
-                    <button class="wishlist-btn">♡</button>
-
-                    <button class="quick-add"
-                        ${parseInt(product.stock) <= 0 ? 'disabled style="opacity:.6;cursor:not-allowed;"' : ""}
-                        data-id="${product.id}"
-                        data-name="${product.name}"
-                        data-price="₹${product.price}"
-                        data-image="${product.image}">
-                        Add to Bag
-                    </button>
-                </div>
-
-                <div class="product-info">
-                    <h3>${product.name}</h3>
-                    <p class="price">₹${product.price}</p>
+            const newId = Date.now().toString();
+            const productCardHTML = `
+                <div class="product-card">
+                    <div class="product-image">
+                        <img src="${image}" alt="${name}">
+                        <button class="wishlist-btn">♡</button>
+                        <button class="quick-add"
+                            ${stock <= 0 ? 'disabled style="opacity:.6;cursor:not-allowed;"' : ""}
+                            data-id="${newId}"
+                            data-name="${name}"
+                            data-price="₹${price}"
+                            data-image="${image}">
+                            Add to Bag
+                        </button>
+                    </div>
+                    <div class="product-info">
+                        <h3>${name}</h3>
+                        <p class="price">₹${price}</p>
                         <p style="font-size:14px;color:#666;">
-                        ${parseInt(product.stock) > 0 ? "Stock: " + product.stock : "Out of Stock"}
-                    </p>
+                            ${stock > 0 ? "Stock: " + stock : "Out of Stock"}
+                        </p>
+                    </div>
                 </div>
             `;
 
-            grid.prepend(card);
+            // Add to DOM
+            const grid = document.querySelector('.product-grid');
+            grid.insertAdjacentHTML('afterbegin', productCardHTML);
 
-            // Save permanently
-            let savedProducts =
-            JSON.parse(localStorage.getItem('aura_products')) || [];
-
+            // Save to localStorage
+            let savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
             savedProducts.push({
-                id: Date.now(),
+                id: newId,
                 name: name,
                 price: price,
                 image: image,
                 stock: stock
             });
+            localStorage.setItem('aura_products', JSON.stringify(savedProducts));
 
-            localStorage.setItem(
-                'aura_products',
-                JSON.stringify(savedProducts)
-            );
-        });
+            // Clear inputs
+            newProductName.value = "";
+            newProductPrice.value = "";
+            newProductImage.value = "";
+            newProductStock.value = "";
+
+            alert("Product Added Successfully!");
+            
+            // Refresh event listeners for new buttons
+            location.reload(); // simple reload to reinitialize all listeners
+        };
     }
 
-    loadCustomProducts();
-
-    // Delete Products
+    // Delete Products (Admin)
     const deleteSelect = document.getElementById('delete-product-select');
     const deleteBtn = document.getElementById('delete-product-btn');
 
     function loadDeleteOptions() {
-
         if (!deleteSelect) return;
-
-        deleteSelect.innerHTML =
-            `<option value="">Select Product</option>`;
-
-        const savedProducts =
-            JSON.parse(localStorage.getItem('aura_products')) || [];
-
+        deleteSelect.innerHTML = `<option value="">Select Product</option>`;
+        const savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
         savedProducts.forEach(product => {
-            deleteSelect.innerHTML += `
-                <option value="${product.id}">
-                    ${product.name}
-                </option>
-            `;
+            deleteSelect.innerHTML += `<option value="${product.id}">${product.name}</option>`;
         });
     }
 
@@ -1001,34 +1020,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (deleteBtn) {
         deleteBtn.onclick = () => {
-
             const id = deleteSelect.value;
-
             if (!id) {
                 alert("Select a product.");
                 return;
             }
-
-            let savedProducts =
-                JSON.parse(localStorage.getItem('aura_products')) || [];
-
-            savedProducts =
-                savedProducts.filter(
-                    product => String(product.id) !== String(id)
-                );
-
-            localStorage.setItem(
-                'aura_products',
-                JSON.stringify(savedProducts)
-            );
-
+            let savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
+            savedProducts = savedProducts.filter(p => String(p.id) !== String(id));
+            localStorage.setItem('aura_products', JSON.stringify(savedProducts));
             alert("Product Deleted!");
-
             location.reload();
         };
     }
 
-    // Edit Products
+    // Edit Products (Admin)
     const editSelect = document.getElementById('edit-product-select');
     const editBtn = document.getElementById('edit-product-btn');
     const editName = document.getElementById('edit-product-name');
@@ -1036,21 +1041,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const editStock = document.getElementById('edit-product-stock');
 
     function loadEditOptions() {
-
         if (!editSelect) return;
-
-        editSelect.innerHTML =
-            `<option value="">Select Product</option>`;
-
-        const savedProducts =
-            JSON.parse(localStorage.getItem('aura_products')) || [];
-
+        editSelect.innerHTML = `<option value="">Select Product</option>`;
+        const savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
         savedProducts.forEach(product => {
-            editSelect.innerHTML += `
-                <option value="${product.id}">
-                    ${product.name}
-                </option>
-            `;
+            editSelect.innerHTML += `<option value="${product.id}">${product.name}</option>`;
         });
     }
 
@@ -1058,123 +1053,77 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (editBtn) {
         editBtn.onclick = () => {
-
             const id = editSelect.value;
-
             if (!id) {
                 alert("Select a product.");
                 return;
             }
-
-            let savedProducts =
-                JSON.parse(localStorage.getItem('aura_products')) || [];
-
-            const product =
-                savedProducts.find(
-                    p => String(p.id) === String(id)
-                );
-
+            let savedProducts = JSON.parse(localStorage.getItem('aura_products')) || [];
+            const product = savedProducts.find(p => String(p.id) === String(id));
             if (!product) return;
 
-            if (editName.value.trim())
-                product.name = editName.value.trim();
+            if (editName.value.trim()) product.name = editName.value.trim();
+            if (editPrice.value.trim()) product.price = editPrice.value.trim();
+            if (editStock.value.trim()) product.stock = parseInt(editStock.value.trim());
 
-            if (editPrice.value.trim())
-                product.price = editPrice.value.trim();
-
-            if (editStock.value.trim())
-                product.stock = editStock.value.trim();
-
-            localStorage.setItem(
-                'aura_products',
-                JSON.stringify(savedProducts)
-            );
-
+            localStorage.setItem('aura_products', JSON.stringify(savedProducts));
             alert("Product Updated!");
-
             location.reload();
         };
     }
+
     // Coupon System
     const couponInput = document.getElementById('coupon-code');
     const applyCouponBtn = document.getElementById('apply-coupon-btn');
 
     if (applyCouponBtn) {
         applyCouponBtn.onclick = () => {
-
             const code = couponInput.value.trim().toUpperCase();
             const total = getCartTotal();
-
             discountAmount = 0;
 
             if (code === "SAVE10") {
                 discountAmount = total * 0.10;
-            }
-            else if (code === "SAVE20") {
+            } else if (code === "SAVE20") {
                 discountAmount = total * 0.20;
-            }
-            else if (code === "FLAT500") {
+            } else if (code === "FLAT500") {
                 discountAmount = 500;
-            }
-            else {
+            } else {
                 alert("Invalid Coupon Code");
                 return;
             }
 
-            const finalAmount =
-                Math.max(0, total - discountAmount);
-
-            checkoutFinalTotal.textContent =
-                `₹${finalAmount.toFixed(2)}`;
-
+            const finalAmount = Math.max(0, total - discountAmount);
+            checkoutFinalTotal.textContent = `₹${finalAmount.toFixed(2)}`;
             alert("Coupon Applied Successfully!");
         };
     }
-    // Delivery Charges
 
+    // Delivery Charges
     if (deliveryType) {
         deliveryType.onchange = updateCheckoutTotal;
     }
+
     // Auto Order Tracking
     function updateOrderStatuses() {
-
-        let orders =
-            JSON.parse(localStorage.getItem('aura_orders')) || [];
-
+        let orders = JSON.parse(localStorage.getItem('aura_orders')) || [];
         orders.forEach(order => {
-
-            if (order.status === "Confirmed") {
-                order.status = "Packed";
-            }
-            else if (order.status === "Packed") {
-                order.status = "Shipped";
-            }
-            else if (order.status === "Shipped") {
-                order.status = "Out for Delivery";
-            }
-            else if (order.status === "Out for Delivery") {
-                order.status = "Delivered";
-            }
-
+            if (order.status === "Confirmed") order.status = "Packed";
+            else if (order.status === "Packed") order.status = "Shipped";
+            else if (order.status === "Shipped") order.status = "Out for Delivery";
+            else if (order.status === "Out for Delivery") order.status = "Delivered";
         });
-
-        localStorage.setItem(
-            'aura_orders',
-            JSON.stringify(orders)
-        );
+        localStorage.setItem('aura_orders', JSON.stringify(orders));
     }
 
-    // Update every 30 seconds
     setInterval(updateOrderStatuses, 30000);
 
     // Premium Cursor Glow
     const cursorGlow = document.getElementById('cursor-glow');
-
     if (cursorGlow) {
         document.addEventListener('mousemove', (e) => {
             cursorGlow.style.left = e.clientX + 'px';
             cursorGlow.style.top = e.clientY + 'px';
         });
     }
-
 });
