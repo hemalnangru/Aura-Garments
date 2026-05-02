@@ -1,19 +1,14 @@
+const { Resend } = require('resend');
 require("dotenv").config();
 
 const express = require("express");
 const path = require("path");
-const nodemailer = require("nodemailer");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const Razorpay = require("razorpay");      // <-- NEW
-const crypto = require("crypto");          // <-- NEW
+const Razorpay = require("razorpay");
+const crypto = require("crypto");
 
-/* IMPORTANT:
-   make sure file names match exactly:
-   ./models/User.js
-   ./models/Order.js
-*/
 const User = require("./models/user");
 const Order = require("./models/orders");
 
@@ -33,7 +28,7 @@ mongoose
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Razorpay with your keys from .env
+// Initialize Razorpay
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
@@ -41,13 +36,10 @@ const razorpay = new Razorpay({
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
-
   if (!authHeader) {
     return res.status(401).json({ message: "No token provided" });
   }
-
   const token = authHeader.split(" ")[1];
-
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
@@ -56,23 +48,13 @@ function authMiddleware(req, res, next) {
     res.status(401).json({ message: "Invalid token" });
   }
 }
+
 app.use(express.static(__dirname));
 app.use(express.json());
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
-
-/* Email Transporter */
-function createTransporter() {
-  return nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
-    }
-  });
-}
 
 /* CHECKOUT API */
 app.post("/api/checkout", async (req, res) => {
@@ -86,8 +68,7 @@ app.post("/api/checkout", async (req, res) => {
       });
     }
 
-    const transporter = createTransporter();
-
+    // Build cart HTML table
     let cartHtml = `
       <table style="width:100%; border-collapse:collapse;">
         <thead>
@@ -99,7 +80,6 @@ app.post("/api/checkout", async (req, res) => {
         </thead>
         <tbody>
     `;
-
     cart.forEach((item) => {
       cartHtml += `
         <tr>
@@ -109,7 +89,6 @@ app.post("/api/checkout", async (req, res) => {
         </tr>
       `;
     });
-
     cartHtml += `
         </tbody>
         <tfoot>
@@ -118,39 +97,48 @@ app.post("/api/checkout", async (req, res) => {
             <th style="padding:8px; text-align:right;">₹${total}</th>
           </tr>
         </tfoot>
-      </table>
+       </table>
     `;
 
-    const mailOptions = {
-      from: `"Aura Garments" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: `Order Confirmation - ${orderId}`,
-      html: `
-        <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto;">
-          <h2>Thank you for your order!</h2>
-          <p>We've received your order <strong>${orderId}</strong>.</p>
-          <p><strong>Payment Method:</strong> ${payment}</p>
-          <h3>Order Details:</h3>
-          ${cartHtml}
-          <br>
-          <p>Please find your invoice attached.</p>
-          <p>Best regards,<br>Aura Garments Team</p>
-        </div>
-      `
-    };
+    const emailHtml = `
+      <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto;">
+        <h2>Thank you for your order!</h2>
+        <p>We've received your order <strong>${orderId}</strong>.</p>
+        <p><strong>Payment Method:</strong> ${payment}</p>
+        <h3>Order Details:</h3>
+        ${cartHtml}
+        <br>
+        <p>Please find your invoice attached.</p>
+        <p>Best regards,<br>Aura Garments Team</p>
+      </div>
+    `;
 
+    // Convert invoice base64 to Buffer for Resend attachment
+    let attachmentBuffer = null;
     if (invoiceBase64) {
-      mailOptions.attachments = [
-        {
-          filename: `Aura-Invoice-${orderId}.pdf`,
-          path: invoiceBase64
-        }
-      ];
+      let base64Data = invoiceBase64;
+      if (invoiceBase64.includes('base64,')) {
+        base64Data = invoiceBase64.split('base64,')[1];
+      }
+      attachmentBuffer = Buffer.from(base64Data, 'base64');
     }
 
-    await transporter.sendMail(mailOptions);
+    // Initialize Resend
+    const resend = new Resend(process.env.RESEND_API_KEY);
 
-    /* SAVE ORDER IN MONGODB */
+    // Send email using Resend
+    await resend.emails.send({
+      from: 'Aura Garments <onboarding@resend.dev>', // Replace with your verified domain later
+      to: email,
+      subject: `Order Confirmation - ${orderId}`,
+      html: emailHtml,
+      attachments: attachmentBuffer ? [{
+        filename: `Aura-Invoice-${orderId}.pdf`,
+        content: attachmentBuffer
+      }] : undefined
+    });
+
+    // Save order to MongoDB
     await Order.create({
       orderId,
       email,
@@ -173,23 +161,18 @@ app.post("/api/checkout", async (req, res) => {
   }
 });
 
-/* ========== NEW RAZORPAY ROUTES ========== */
-
-// Create a Razorpay order (called from frontend before payment)
+/* RAZORPAY ROUTES */
 app.post("/api/create-razorpay-order", async (req, res) => {
   try {
     const { amount } = req.body;
-
     if (!amount || isNaN(amount)) {
       return res.status(400).json({ error: "Invalid amount" });
     }
-
     const options = {
-      amount: Math.round(amount * 100), // amount in paise
+      amount: Math.round(amount * 100),
       currency: "INR",
       receipt: "receipt_" + Date.now(),
     };
-
     const order = await razorpay.orders.create(options);
     res.json(order);
   } catch (error) {
@@ -198,19 +181,15 @@ app.post("/api/create-razorpay-order", async (req, res) => {
   }
 });
 
-// Verify payment signature after successful payment
 app.post("/api/verify-payment", async (req, res) => {
   try {
     const { order_id, payment_id, signature } = req.body;
-
     const body = order_id + "|" + payment_id;
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(body.toString())
       .digest("hex");
-
     if (expectedSignature === signature) {
-      // Payment is genuine – you can update order status in your DB here
       res.json({ success: true, message: "Payment verified" });
     } else {
       res.status(400).json({ success: false, message: "Invalid signature" });
@@ -221,12 +200,9 @@ app.post("/api/verify-payment", async (req, res) => {
   }
 });
 
-/* ========== END RAZORPAY ROUTES ========== */
-
 /* SIGNUP API */
 app.post("/api/signup", async (req, res) => {
   try {
-
     const name = req.body.name?.trim();
     const password = req.body.password?.trim();
     const email = req.body.email?.trim().toLowerCase();
@@ -238,9 +214,7 @@ app.post("/api/signup", async (req, res) => {
       });
     }
 
-    const existingUser = await User.findOne({
-      email: email
-    });
+    const existingUser = await User.findOne({ email });
     console.log("Signup Email:", email);
     console.log("Existing User:", existingUser);
 
@@ -252,17 +226,12 @@ app.post("/api/signup", async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    await User.create({ name, email, password: hashedPassword });
 
-    await User.create({
-      name,
-      email,
-      password: hashedPassword
-    });
-
-    const transporter = createTransporter();
-
-    await transporter.sendMail({
-      from: `"Aura Garments" <${process.env.EMAIL_USER}>`,
+    // Send welcome email using Resend
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({
+      from: 'Aura Garments <onboarding@resend.dev>',
       to: email,
       subject: `Welcome to Aura Garments, ${name}!`,
       html: `
@@ -279,7 +248,6 @@ app.post("/api/signup", async (req, res) => {
       success: true,
       message: "Signup successful"
     });
-
   } catch (error) {
     console.error("Signup Error:", error);
     res.status(500).json({
@@ -294,48 +262,34 @@ app.post("/api/login", async (req, res) => {
   try {
     const password = req.body.password;
     const email = req.body.email.trim().toLowerCase();
-
     const user = await User.findOne({ email });
-
     if (!user) {
-      return res.json({
-        success: false,
-        message: "User not found"
-      });
+      return res.json({ success: false, message: "User not found" });
     }
-
     const match = await bcrypt.compare(password, user.password);
-
     if (!match) {
-      return res.json({
-        success: false,
-        message: "Wrong password"
-      });
+      return res.json({ success: false, message: "Wrong password" });
     }
-
     const token = jwt.sign(
       { userId: user._id, email: user.email },
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
-    
     res.json({
       success: true,
       message: "Login successful",
       token,
-      user: {
-        name: user.name,
-        email: user.email
-      }
+      user: { name: user.name, email: user.email }
     });
-
   } catch (error) {
     console.error("Login Error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Login failed"
-    });
+    res.status(500).json({ success: false, message: "Login failed" });
   }
+});
+
+/* RAZORPAY KEY ENDPOINT (for frontend to fetch key securely) */
+app.get("/api/razorpay-key", (req, res) => {
+  res.json({ key: process.env.RAZORPAY_KEY_ID });
 });
 
 app.listen(PORT, () => {
